@@ -1,0 +1,1 @@
+ALTER TABLE `users` ADD `assessor_code` text DEFAULT '' NOT NULL;

@@ -1,0 +1,51 @@
+import assert from 'node:assert/strict';
+import {DatabaseSync} from 'node:sqlite';
+import {readFile,readdir,mkdir} from 'node:fs/promises';
+import {build} from '../node_modules/.pnpm/node_modules/esbuild/lib/main.js';
+const sqlite=new DatabaseSync(':memory:');
+const journal=JSON.parse(await readFile('drizzle/meta/_journal.json','utf8'));
+for(const entry of journal.entries){sqlite.exec(await readFile(`drizzle/${entry.tag}.sql`,'utf8'));}
+class Statement{constructor(sql){this.sql=sql;this.args=[];}bind(...args){this.args=args;return this;}async first(){return sqlite.prepare(this.sql).get(...this.args)||null;}async all(){return {results:sqlite.prepare(this.sql).all(...this.args)};}async run(){const r=sqlite.prepare(this.sql).run(...this.args);return {success:true,meta:{changes:Number(r.changes)}};}}
+const storage=new Map();
+globalThis.__lspTestEnv={DB:{prepare:s=>new Statement(s),async batch(ss){sqlite.exec('BEGIN');try{const results=[];for(const s of ss)results.push(await s.run());sqlite.exec('COMMIT');return results;}catch(e){sqlite.exec('ROLLBACK');throw e;}}},BUCKET:{async put(k,v){storage.set(k,v)},async get(k){return storage.has(k)?{body:storage.get(k)}:null}},INITIAL_ADMIN_PASSWORD:'TestOnly-Password-987!'};
+await mkdir('.sites-runtime',{recursive:true});await build({entryPoints:['app/api/lsp/route.ts'],bundle:true,platform:'node',format:'esm',outfile:'.sites-runtime/route-test.mjs',alias:{'@':process.cwd()},plugins:[{name:'test-env',setup(b){b.onResolve({filter:/^cloudflare:workers$/},()=>({path:'env',namespace:'test'}));b.onLoad({filter:/.*/,namespace:'test'},()=>({contents:'export const env=globalThis.__lspTestEnv;'}));}}]});
+const route=await import('../.sites-runtime/route-test.mjs?'+Date.now());let count=0;
+async function call(action,data={},cookie='',method='POST',status=200){const url='https://test.invalid/api/lsp'+(method==='GET'?'?'+new URLSearchParams({action,...data}):'');const r=await route[method](new Request(url,{method,headers:{cookie,origin:'https://test.invalid','content-type':'application/json'},...(method==='POST'?{body:JSON.stringify({action,...data})}:{})}));const d=await r.json();assert.equal(r.status,status,action+': '+JSON.stringify(d));count++;return {data:d,cookie:r.headers.get('set-cookie')?.split(';')[0]||cookie};}
+let admin=await call('login',{username:'admin',password:'TestOnly-Password-987!'});
+await call('users',{rows:[]},admin.cookie,'POST',403);
+await call('password',{oldPassword:'TestOnly-Password-987!',password:'AdminTest-Changed123'},admin.cookie);
+admin=await call('login',{username:'admin',password:'AdminTest-Changed123'});
+await call('users',{rows:[{username:'student1',password:'StudentTest-987',role:'asesi',schemeId:'jts'},{username:'student2',password:'StudentTest-987',role:'asesi',schemeId:'jts',className:'XII TKJ'},{username:'assessor1',password:'AssessorTest-987',role:'asesor',assessorCode:'MET-001'}]},admin.cookie);
+const state=(await call('state',{},admin.cookie,'GET')).data;assert.equal(state.schemes.length,3);const student=state.users.find(u=>u.username==='student1'),other=state.users.find(u=>u.username==='student2'),assessor=state.users.find(u=>u.username==='assessor1');
+await call('userUpdate',{...student,assessorId:assessor.id,active:true},admin.cookie);
+const signIn=async(username,old,password)=>{let a=await call('login',{username,password:old});await call('password',{oldPassword:old,password},a.cookie);return (await call('login',{username,password})).cookie;};
+const sc=await signIn('student1','StudentTest-987','StudentChanged-987');const ac=await signIn('assessor1','AssessorTest-987','AssessorChanged-987');
+const ts=(await call('templates',{schemeId:'jts'},admin.cookie,'GET')).data.templates;assert.equal(ts.filter(t=>t.active).length,18);assert.equal(ts.find(t=>t.code==='APL.02').fields.filter(f=>f.role==='asesi'&&f.type==='select').length,13);assert.equal(ts.find(t=>t.code==='IA.01').fields.filter(f=>f.type==='select'&&f.section.startsWith('J.')).length,40);
+const safe=(await call('templates',{schemeId:'jts'},sc,'GET')).data.templates;assert(!safe.some(t=>t.code==='IA.05.B'));
+await call('document',{schemeId:'jts',userId:student.id,code:'IA.05.B'},sc,'GET',403);
+await call('document',{schemeId:'jts',userId:other.id,code:'APL.01'},sc,'GET',403);
+await call('document',{schemeId:'jts',userId:other.id,code:'APL.01'},ac,'GET',403);
+await call('users',{rows:[]},sc,'POST',403);
+const template=ts.find(t=>t.code==='APL.01');const fields=Object.fromEntries(template.fields.filter(f=>f.role==='asesi'&&f.required).map(f=>[f.id,f.type==='select'?f.options[0]:f.type==='date'?'2008-01-01':'Test data']));
+let d=(await call('saveDocument',{schemeId:'jts',userId:student.id,code:'APL.01',revision:0,values:fields},sc)).data;
+const adminField=template.fields.find(f=>f.role==='admin').id;
+await call('saveDocument',{schemeId:'jts',userId:student.id,code:'APL.01',revision:d.revision,values:{...fields,[adminField]:'Memenuhi syarat'}},sc,'POST',403);
+await call('saveDocument',{schemeId:'jts',userId:student.id,code:'APL.01',revision:0,values:fields},sc,'POST',409);
+const image='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLbtAAAAABJRU5ErkJggg==';
+d=(await call('sign',{schemeId:'jts',userId:student.id,code:'APL.01',revision:d.revision,image},sc)).data;assert(d.document.signatures.asesi.hash);assert.equal(d.document.status,'Diajukan');
+await call('saveDocument',{schemeId:'jts',userId:student.id,code:'APL.01',revision:d.revision,values:fields},sc,'POST',403);
+d=(await call('reopen',{schemeId:'jts',userId:student.id,code:'APL.01',revision:d.revision,note:'Fix'},ac)).data;assert.equal(Object.keys(d.document.signatures).length,0);
+d=(await call('saveDocument',{schemeId:'jts',userId:student.id,code:'APL.01',revision:d.revision,values:{...fields,f1:'Revised name'}},sc)).data;
+assert.equal((await call('state',{},sc,'GET')).data.user.name,'Revised name');
+for(const t of ts.filter(t=>t.active&&t.code!=='APL.01')){const r=await call('document',{schemeId:'jts',userId:student.id,code:t.code},admin.cookie,'GET');await call('saveDocument',{schemeId:'jts',userId:student.id,code:t.code,revision:r.data.revision,values:{}},admin.cookie,'POST',403);}
+let ex=(await call('exam',{schemeId:'jts'},admin.cookie,'GET')).data.exam;assert.equal(ex.questions.length,10);assert(ex.questions[0].text.startsWith('Langkah pertama'));assert.equal(ex.questions[5].answer,'A');assert(ex.questions[5].review);
+await call('saveExam',{schemeId:'jts',exam:{...ex,active:true}},admin.cookie,'POST',400);
+ex.questions[5].answer='C';ex.questions[5].review=false;ex.active=true;await call('saveExam',{schemeId:'jts',exam:ex},admin.cookie);
+const safeExam=(await call('exam',{schemeId:'jts'},sc,'GET')).data.exam;assert(safeExam.questions.every(q=>!('answer'in q)&&!('note'in q)));
+await call('startExam',{schemeId:'jts',userId:student.id},sc);const attempt=(await call('attempt',{schemeId:'jts',userId:student.id},sc,'GET')).data.attempt;assert(attempt.questions.every(q=>!('answer'in q)));
+await call('submitExam',{schemeId:'jts',userId:student.id,answers:{}},sc,'POST',400);
+const result=(await call('submitExam',{schemeId:'jts',userId:student.id,answers:Object.fromEntries(ex.questions.map(q=>[q.id,q.answer]))},sc)).data;assert.equal(result.score,100);
+await call('submitExam',{schemeId:'jts',userId:student.id,answers:{}},sc,'POST',400);
+await call('users',{rows:[{username:'newuser',password:'Password-12345',role:'asesi'},{username:'student1',password:'Password-12345',role:'asesi'}]},admin.cookie,'POST',400);assert(!sqlite.prepare('SELECT * FROM users WHERE username=?').get('newuser'));
+const csrf=await route.POST(new Request('https://test.invalid/api/lsp',{method:'POST',headers:{cookie:admin.cookie,origin:'https://evil.invalid','content-type':'application/json'},body:JSON.stringify({action:'logout'})}));assert.equal(csrf.status,403);count++;
+console.log(`PASS: ${count} API checks; 18 forms, 13 self-assessment elements, 40 observation criteria, role isolation, signatures, stale updates, Excel import semantics and exam-key protection.`);
